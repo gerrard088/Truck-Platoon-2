@@ -13,8 +13,16 @@ def publish_commands(throttle_publishers, current_velocities, target_velocity, l
         throttle_value = 0.8
         if current_velocities[truck_id] > target_velocity:
             throttle_value = 0.0
-        if abs(last_steering[truck_id]) > 3:
-            throttle_value *= 0.8
+
+        steering_abs = abs(last_steering[truck_id])
+        if steering_abs > 2.5:
+            # 고속 곡선에서 동시 언더/오버슈트를 막기 위해 조향각에 비례해 추가 감속
+            if steering_abs >= 10.0:
+                steering_scale = 0.2
+            else:
+                reduction_ratio = (steering_abs - 2.5) / 7.5
+                steering_scale = 1.0 - 0.8 * reduction_ratio
+            throttle_value *= max(0.2, steering_scale)
 
         msg = Float32()
         msg.data = throttle_value

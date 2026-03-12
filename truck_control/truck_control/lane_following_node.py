@@ -71,7 +71,7 @@ class LaneFollowingNode(Node):
         
         # runtime state
         self.current_velocities = {i: 0.0 for i in range(3)}
-        self.target_velocity = 14.5
+        self.target_velocity = 19.5
         self.last_steering = {i: 0.0 for i in range(3)}
         self.last_left_fit = {i: None for i in range(3)}
         self.last_right_fit = {i: None for i in range(3)}
