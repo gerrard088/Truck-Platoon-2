@@ -8,7 +8,7 @@ import rclpy
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
-from std_msgs.msg import Float32, Float32MultiArray
+from std_msgs.msg import Float32, Float32MultiArray, Int32MultiArray
 
 try:
     import matlab.engine  # type: ignore
@@ -22,6 +22,12 @@ class TruckState:
     accel_ms2: float = 0.0
     pitch_deg: float = 0.0
     last_z: Optional[float] = None
+    pose_x: Optional[float] = None
+    pose_y: Optional[float] = None
+    pose_z: Optional[float] = None
+    grade_deg: float = 0.0
+    model_accel_ms2: float = 0.0
+    prev_velocity_ms: Optional[float] = None
     soc: float = 80.0
     energy_wh: float = 0.0
     distance_m: float = 0.0
@@ -47,6 +53,15 @@ class EnergySocBridgeNode(Node):
         self.declare_parameter("aux_power_w", 3000.0)
         self.declare_parameter("battery_capacity_kwh", 450.0)
         self.declare_parameter("initial_soc", 80.0)
+        self.declare_parameter("platoon_order_topic", "/platoon_order")
+        self.declare_parameter("aero_drag_multipliers", [1.0, 0.75, 0.85])
+        self.declare_parameter("use_pose_grade", True)
+        self.declare_parameter("grade_smoothing_alpha", 0.25)
+        self.declare_parameter("min_grade_distance_m", 0.5)
+        self.declare_parameter("max_abs_grade_deg", 8.0)
+        self.declare_parameter("use_velocity_diff_accel", True)
+        self.declare_parameter("accel_smoothing_alpha", 0.35)
+        self.declare_parameter("max_abs_accel_ms2", 6.0)
 
         self.truck_count = int(self.get_parameter("truck_count").value)
         self.publish_hz = float(self.get_parameter("publish_hz").value)
@@ -61,8 +76,19 @@ class EnergySocBridgeNode(Node):
         self.aux_power_w = float(self.get_parameter("aux_power_w").value)
         self.battery_capacity_kwh = float(self.get_parameter("battery_capacity_kwh").value)
         initial_soc = float(self.get_parameter("initial_soc").value)
+        self.platoon_order_topic = str(self.get_parameter("platoon_order_topic").value)
+        raw_drag_multipliers = self.get_parameter("aero_drag_multipliers").value
+        self.use_pose_grade = bool(self.get_parameter("use_pose_grade").value)
+        self.grade_smoothing_alpha = float(self.get_parameter("grade_smoothing_alpha").value)
+        self.min_grade_distance_m = float(self.get_parameter("min_grade_distance_m").value)
+        self.max_abs_grade_deg = float(self.get_parameter("max_abs_grade_deg").value)
+        self.use_velocity_diff_accel = bool(self.get_parameter("use_velocity_diff_accel").value)
+        self.accel_smoothing_alpha = float(self.get_parameter("accel_smoothing_alpha").value)
+        self.max_abs_accel_ms2 = float(self.get_parameter("max_abs_accel_ms2").value)
 
         self.states: Dict[int, TruckState] = {i: TruckState(soc=initial_soc) for i in range(self.truck_count)}
+        self.truck_rank_by_id: Dict[int, int] = {i: i for i in range(self.truck_count)}
+        self.aero_drag_multipliers = self._sanitize_drag_multipliers(raw_drag_multipliers)
         self.last_update_time = self.get_clock().now()
 
         self.soc_publishers: Dict[int, Any] = {}
@@ -82,8 +108,25 @@ class EnergySocBridgeNode(Node):
         self.timer = self.create_timer(period, self._on_timer)
         self.get_logger().info(
             f"energy_soc_bridge started: trucks={self.truck_count}, hz={self.publish_hz:.1f}, "
-            f"matlab_mode={self._matlab_available}"
+            f"matlab_mode={self._matlab_available}, aero_drag_multipliers={self.aero_drag_multipliers}"
         )
+
+    def _sanitize_drag_multipliers(self, values: Any) -> list:
+        multipliers = []
+        if isinstance(values, (list, tuple)):
+            for value in values:
+                try:
+                    multipliers.append(max(0.05, float(value)))
+                except (TypeError, ValueError):
+                    continue
+
+        if not multipliers:
+            multipliers = [1.0]
+
+        while len(multipliers) < self.truck_count:
+            multipliers.append(multipliers[-1])
+
+        return multipliers[:self.truck_count]
 
     def _configure_matlab_engine(self) -> None:
         if not self.use_matlab_engine or matlab is None:
@@ -119,11 +162,12 @@ class EnergySocBridgeNode(Node):
             path = os.path.join(self.log_dir, f"truck{truck_id}_energy.csv")
             f = open(path, "w", newline="", encoding="utf-8")
             w = csv.writer(f)
-            w.writerow(["time_sec", "velocity_ms", "accel_ms2", "pitch_deg", "battery_power_w", "soc", "wh_per_km"])
+            w.writerow(["time_sec", "velocity_ms", "accel_ms2", "pitch_deg", "model_accel_ms2", "model_grade_deg", "battery_power_w", "soc", "wh_per_km"])
             self._csv_files[truck_id] = f
             self._csv_writers[truck_id] = w
 
     def _configure_io(self) -> None:
+        self.create_subscription(Int32MultiArray, self.platoon_order_topic, self._order_cb, 10)
         for truck_id in range(self.truck_count):
             self.create_subscription(
                 Float32, f"/truck{truck_id}/velocity", lambda msg, i=truck_id: self._velocity_cb(msg, i), 10
@@ -153,8 +197,44 @@ class EnergySocBridgeNode(Node):
         self.states[truck_id].pitch_deg = float(msg.data)
 
     def _pose_cb(self, msg: PoseStamped, truck_id: int) -> None:
-        # Keep z only for diagnostics/future grade fallback when pitch topic is absent.
-        self.states[truck_id].last_z = float(msg.pose.position.z)
+        st = self.states[truck_id]
+        x = float(msg.pose.position.x)
+        y = float(msg.pose.position.y)
+        z = float(msg.pose.position.z)
+
+        if self.use_pose_grade and st.pose_x is not None and st.pose_y is not None and st.pose_z is not None:
+            dx = x - st.pose_x
+            dy = y - st.pose_y
+            dz = z - st.pose_z
+            planar_distance = math.hypot(dx, dy)
+            if planar_distance >= self.min_grade_distance_m:
+                instant_grade_deg = math.degrees(math.atan2(dz, planar_distance))
+                instant_grade_deg = max(-self.max_abs_grade_deg, min(self.max_abs_grade_deg, instant_grade_deg))
+                alpha = max(0.0, min(1.0, self.grade_smoothing_alpha))
+                st.grade_deg = ((1.0 - alpha) * st.grade_deg) + (alpha * instant_grade_deg)
+
+        st.last_z = z
+        st.pose_x = x
+        st.pose_y = y
+        st.pose_z = z
+
+    def _order_cb(self, msg: Int32MultiArray) -> None:
+        order = [int(truck_id) for truck_id in msg.data]
+        if len(order) != self.truck_count:
+            self.get_logger().warn(f"Ignoring invalid platoon order length: {order}")
+            return
+
+        expected_ids = set(range(self.truck_count))
+        if set(order) != expected_ids:
+            self.get_logger().warn(f"Ignoring invalid platoon order ids: {order}")
+            return
+
+        rank_by_id = {truck_id: rank for rank, truck_id in enumerate(order)}
+        if rank_by_id == self.truck_rank_by_id:
+            return
+
+        self.truck_rank_by_id = rank_by_id
+        self.get_logger().info(f"Updated platoon order for energy model: {order}")
 
     def _on_timer(self) -> None:
         now = self.get_clock().now()
@@ -166,7 +246,9 @@ class EnergySocBridgeNode(Node):
         stamp_sec = now.nanoseconds / 1e9
         for truck_id in range(self.truck_count):
             st = self.states[truck_id]
-            power_w = self._estimate_power_w(st)
+            model_accel_ms2 = self._effective_accel_ms2(st, dt)
+            model_grade_deg = self._effective_grade_deg(st)
+            power_w = self._estimate_power_w(truck_id, st, model_accel_ms2, model_grade_deg)
             st.battery_power_w = power_w
 
             delta_wh = power_w * (dt / 3600.0)
@@ -185,13 +267,43 @@ class EnergySocBridgeNode(Node):
             self._publish_one(truck_id, st)
             self._csv_writers[truck_id].writerow(
                 [f"{stamp_sec:.3f}", f"{st.velocity_ms:.4f}", f"{st.accel_ms2:.4f}", f"{st.pitch_deg:.4f}",
-                 f"{st.battery_power_w:.2f}", f"{st.soc:.4f}", f"{st.wh_per_km:.4f}"]
+                 f"{st.model_accel_ms2:.4f}", f"{model_grade_deg:.4f}", f"{st.battery_power_w:.2f}",
+                 f"{st.soc:.4f}", f"{st.wh_per_km:.4f}"]
             )
 
-    def _estimate_power_w(self, st: TruckState) -> float:
+    def _effective_accel_ms2(self, st: TruckState, dt: float) -> float:
+        if not self.use_velocity_diff_accel or dt <= 0.0:
+            st.model_accel_ms2 = st.accel_ms2
+            st.prev_velocity_ms = st.velocity_ms
+            return st.model_accel_ms2
+
+        if st.prev_velocity_ms is None:
+            st.prev_velocity_ms = st.velocity_ms
+            st.model_accel_ms2 = 0.0
+            return st.model_accel_ms2
+
+        raw_accel = (st.velocity_ms - st.prev_velocity_ms) / dt
+        st.prev_velocity_ms = st.velocity_ms
+        raw_accel = max(-self.max_abs_accel_ms2, min(self.max_abs_accel_ms2, raw_accel))
+        alpha = max(0.0, min(1.0, self.accel_smoothing_alpha))
+        st.model_accel_ms2 = ((1.0 - alpha) * st.model_accel_ms2) + (alpha * raw_accel)
+        return st.model_accel_ms2
+
+    def _effective_grade_deg(self, st: TruckState) -> float:
+        if self.use_pose_grade and st.pose_x is not None and st.pose_y is not None and st.pose_z is not None:
+            return st.grade_deg
+        return st.pitch_deg
+
+    def _effective_cd_a(self, truck_id: int) -> float:
+        rank = self.truck_rank_by_id.get(truck_id, truck_id)
+        multiplier = self.aero_drag_multipliers[min(rank, len(self.aero_drag_multipliers) - 1)]
+        return self.cd_a * multiplier
+
+    def _estimate_power_w(self, truck_id: int, st: TruckState, accel_ms2: float, grade_deg: float) -> float:
         v = max(0.0, st.velocity_ms)
-        a = st.accel_ms2
-        pitch_deg = st.pitch_deg
+        a = accel_ms2
+        pitch_deg = grade_deg
+        effective_cd_a = self._effective_cd_a(truck_id)
 
         if self._matlab_available and self._matlab_engine is not None:
             try:
@@ -201,7 +313,7 @@ class EnergySocBridgeNode(Node):
                     float(pitch_deg),
                     float(self.mass_kg),
                     float(self.rolling_resistance),
-                    float(self.cd_a),
+                    float(effective_cd_a),
                     float(self.air_density),
                     float(self.drive_efficiency),
                     float(self.regen_efficiency),
@@ -213,14 +325,14 @@ class EnergySocBridgeNode(Node):
                 self.get_logger().warn(f"MATLAB call failed, switching to Python model: {exc}")
                 self._matlab_available = False
 
-        return self._python_power_step(v, a, pitch_deg)
+        return self._python_power_step(v, a, pitch_deg, effective_cd_a)
 
-    def _python_power_step(self, v: float, a: float, pitch_deg: float) -> float:
+    def _python_power_step(self, v: float, a: float, pitch_deg: float, cd_a: float) -> float:
         g = 9.81
         pitch_rad = math.radians(pitch_deg)
         grade_force = self.mass_kg * g * math.sin(pitch_rad)
         rolling_force = self.mass_kg * g * self.rolling_resistance
-        aero_force = 0.5 * self.air_density * self.cd_a * (v ** 2)
+        aero_force = 0.5 * self.air_density * cd_a * (v ** 2)
         inertial_force = self.mass_kg * a
         total_force = grade_force + rolling_force + aero_force + inertial_force
         wheel_power = total_force * v
@@ -228,7 +340,8 @@ class EnergySocBridgeNode(Node):
         if wheel_power >= 0.0:
             batt_power = wheel_power / max(0.05, self.drive_efficiency) + self.aux_power_w
         else:
-            batt_power = wheel_power * max(0.0, min(1.0, self.regen_efficiency)) + self.aux_power_w
+            # Regen disabled: decel energy is dissipated mechanically, battery only supplies auxiliaries.
+            batt_power = self.aux_power_w
         return batt_power
 
     def _publish_one(self, truck_id: int, st: TruckState) -> None:

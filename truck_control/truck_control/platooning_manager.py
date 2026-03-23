@@ -26,7 +26,7 @@ class PlatooningManager:
         # PID 제어 파라미터
         self.min_distance = 5.0      # 정지 시 최소 간격 (m)
         self.time_gap = 0.8          # 시간 간격 (s)
-        self.target_distance = 12.0  # 동적 계산 전 기본값 (m)
+        self.target_distance = 5.0  # 동적 계산 전 기본값 (m)
         self.safe_distance = 4.5     # 최소 안전 간격 (m) 이하이면 저속 혹은 정지
         self.kp = 0.3
         self.ki = 0.01

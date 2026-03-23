@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Int32MultiArray
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -69,6 +69,7 @@ class LaneFollowingNode(Node):
         self.platooning_manager = {i: PlatooningManager(self, f'truck{i}') for i in range(3)}
         self.steer_publishers = {i: self.create_publisher(Float32, f'/truck{i}/steer_control', 10) for i in range(3)}
         self.throttle_publishers = {i: self.create_publisher(Float32, f'/truck{i}/throttle_control', 10) for i in range(3)}
+        self.order_publisher = self.create_publisher(Int32MultiArray, '/platoon_order', 10)
         self.velocity_subscribers = {
             i: self.create_subscription(Float32, f'/truck{i}/velocity', lambda msg, id=i: self.velocity_callback(msg, id), 10)
             for i in range(3)
@@ -180,6 +181,13 @@ class LaneFollowingNode(Node):
             self.get_logger().error(f"Failed to connect to CARLA or find actors: {e}")
             self.world = None
             self.carla_map = None
+
+        self._publish_truck_order()
+
+    def _publish_truck_order(self):
+        msg = Int32MultiArray()
+        msg.data = list(self.truck_order)
+        self.order_publisher.publish(msg)
 
     def get_vehicle_waypoint(self, truck_id):
         actor = self.carla_actors.get(truck_id)
@@ -786,6 +794,8 @@ class LaneFollowingNode(Node):
             old_order = list(self.truck_order)
             old_order.remove(self.promote_target_id)
             self.truck_order = [self.promote_target_id] + old_order
+
+        self._publish_truck_order()
 
         for i in range(3):
             self.reset_lane_state(i)
