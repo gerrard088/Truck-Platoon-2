@@ -5,7 +5,7 @@ from typing import Dict
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32, Int32
+from std_msgs.msg import Float32, Int32, Int32MultiArray
 
 
 @dataclass
@@ -25,10 +25,12 @@ class EnergySubscriber(Node):
         self.maneuver_elapsed_sec = 0.0
         self.last_maneuver_duration_sec = 0.0
         self.maneuver_count = 0
+        self.truck_roles: Dict[int, str] = {0: 'Leader', 1: 'Mid', 2: 'Tail'}
 
         self.create_subscription(Float32, '/platoon_maneuver_elapsed_sec', self._maneuver_elapsed_cb, 10)
         self.create_subscription(Float32, '/platoon_maneuver_last_duration_sec', self._maneuver_last_duration_cb, 10)
         self.create_subscription(Int32, '/platoon_maneuver_count', self._maneuver_count_cb, 10)
+        self.create_subscription(Int32MultiArray, '/platoon_order', self._platoon_order_cb, 10)
 
         for truck_id in range(self.truck_count):
             self.create_subscription(
@@ -67,9 +69,20 @@ class EnergySubscriber(Node):
     def _maneuver_count_cb(self, msg: Int32) -> None:
         self.maneuver_count = int(msg.data)
 
+    def _platoon_order_cb(self, msg: Int32MultiArray) -> None:
+        order = [int(truck_id) for truck_id in msg.data]
+        if len(order) != self.truck_count:
+            return
+
+        roles = ['Leader', 'Mid', 'Tail']
+        for rank, truck_id in enumerate(order):
+            label = roles[min(rank, len(roles) - 1)]
+            self.truck_roles[truck_id] = label
+
     def _update_ui(self) -> None:
         self.dashboard.update(
             self.states,
+            self.truck_roles,
             self.maneuver_elapsed_sec,
             self.last_maneuver_duration_sec,
             self.maneuver_count,
@@ -164,6 +177,9 @@ class EnergyDashboardUI:
                 fg="#17375E",
             ).pack(anchor="w")
 
+            role_label = tk.Label(card, text="Role: Leader", font=("Helvetica", 11, "bold"), bg="white", fg="#2B4A6F")
+            role_label.pack(anchor="w", pady=(4, 2))
+
             speed_label = tk.Label(card, text="Speed: 0.0 km/h", font=("Helvetica", 12), bg="white")
             speed_label.pack(anchor="w", pady=(8, 2))
 
@@ -185,6 +201,7 @@ class EnergyDashboardUI:
             power_canvas.pack(anchor="w")
 
             self.cards[truck_id] = {
+                "role_label": role_label,
                 "speed_label": speed_label,
                 "soc_label": soc_label,
                 "power_label": power_label,
@@ -196,6 +213,7 @@ class EnergyDashboardUI:
     def update(
         self,
         states: Dict[int, TruckEnergyState],
+        truck_roles: Dict[int, str],
         maneuver_elapsed_sec: float,
         last_maneuver_duration_sec: float,
         maneuver_count: int,
@@ -210,6 +228,7 @@ class EnergyDashboardUI:
             total_soc += st.soc
 
             card = self.cards[truck_id]
+            card["role_label"].config(text=f"Role: {truck_roles.get(truck_id, 'Unknown')}")
             card["speed_label"].config(text=f"Speed: {speed_kmh:5.1f} km/h")
             card["soc_label"].config(text=f"SOC: {st.soc:5.1f} %")
             card["power_label"].config(text=f"Power: {power_kw:6.1f} kW")

@@ -143,7 +143,7 @@ class LaneFollowingNode(Node):
         self.relax_full_gain = 8.0
         self.relax_full_time = 1.2
         self.relax_floor = 18.0
-        self.guard_scale = {"SUCCESSOR": 0.9, "FOLLOWER": 0.9, "PROMOTE_TARGET": 1.0, "REJOIN": 1.0, "": 1.0}
+        self.guard_scale = {"SUCCESSOR": 0.9, "FOLLOWER": 0.7, "PROMOTE_TARGET": 1.0, "REJOIN": 1.0, "": 1.0}
         self._guard_pending = {i: False for i in range(3)}
         self._guard_timer = {}
 
@@ -581,6 +581,13 @@ class LaneFollowingNode(Node):
                 self.get_logger().info(f"[{tag}] Truck {truck_id} 가드 취소(FSM 종료/전이)")
                 return self._cancel_guard(truck_id, tag)
             if (self.change_timeout_sec is not None) and (time.monotonic() - start_ts > self.change_timeout_sec):
+                if tag == "FOLLOWER":
+                    self.get_logger().warn(
+                        f"[{tag}] Truck {truck_id} 타임아웃({self.change_timeout_sec}s). "
+                        "가드를 해제하고 차선 변경을 강행합니다."
+                    )
+                    self._cancel_guard(truck_id, tag)
+                    return self.change_lane(truck_id, direction)
                 self.get_logger().warn(f"[{tag}] Truck {truck_id} 타임아웃({self.change_timeout_sec}s). 취소.")
                 return self._cancel_guard(truck_id, tag)
             elapsed = time.monotonic() - start_ts
