@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32, Int32MultiArray
+from std_msgs.msg import Float32, Int32, Int32MultiArray
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from rclpy.qos import QoSProfile, ReliabilityPolicy
@@ -52,8 +52,12 @@ class LaneFollowingNode(Node):
         self.follower_id = -1
         self.promote_target_id = -1
         self.promote_original_leader_id = -1
+        self.current_leader_id = self.truck_order[0]
+        self.current_successor_id = self.truck_order[1]
+        self.current_follower_id = self.truck_order[2]
         self.maneuver_start_time = None
         self.last_maneuver_duration_sec = 0.0
+        self.maneuver_count = 0
 
         # IO wiring
         self.distance_sensor = {i: DistanceSensor(self, f'truck{i}') for i in range(3)}
@@ -63,6 +67,7 @@ class LaneFollowingNode(Node):
         self.order_publisher = self.create_publisher(Int32MultiArray, '/platoon_order', 10)
         self.maneuver_elapsed_publisher = self.create_publisher(Float32, '/platoon_maneuver_elapsed_sec', 10)
         self.maneuver_last_duration_publisher = self.create_publisher(Float32, '/platoon_maneuver_last_duration_sec', 10)
+        self.maneuver_count_publisher = self.create_publisher(Int32, '/platoon_maneuver_count', 10)
         self.velocity_subscribers = {
             i: self.create_subscription(Float32, f'/truck{i}/velocity', lambda msg, id=i: self.velocity_callback(msg, id), 10)
             for i in range(3)
@@ -122,7 +127,9 @@ class LaneFollowingNode(Node):
         
         # lane-change timing tunables
         self.lc_dt = 0.1
-        self.lc_step = 0.05
+        self.lc_step = 0.04
+        self.lc_step_left = 0.032
+        self.lc_step_right = 0.02
         
         # maneuver timing/speeds
         self.leader_slow_factor = 0.65
@@ -154,7 +161,7 @@ class LaneFollowingNode(Node):
         self.auto_scenario_enabled = True
         self.auto_trigger_center_x = -9.2
         self.auto_trigger_center_y = -93.3
-        self.auto_trigger_half_x_m = 3.0
+        self.auto_trigger_half_x_m = 3.0 + self.waypoint_lane_width_m
         self.auto_trigger_half_y_m = 12.0
         self.auto_trigger_latched = False
         self.auto_next_direction = 'left'
@@ -190,14 +197,29 @@ class LaneFollowingNode(Node):
             self.carla_map = None
 
         self._publish_truck_order()
+        self._refresh_idle_role_assignment()
+        self._publish_maneuver_metrics()
 
     def _publish_truck_order(self):
         msg = Int32MultiArray()
         msg.data = list(self.truck_order)
         self.order_publisher.publish(msg)
 
+    def _refresh_idle_role_assignment(self):
+        if len(self.truck_order) >= 3:
+            self.current_leader_id = self.truck_order[0]
+            self.current_successor_id = self.truck_order[1]
+            self.current_follower_id = self.truck_order[2]
+            self.get_logger().info(
+                f"현재 역할 재정의 -> Leader: {self.current_leader_id}, "
+                f"Follower1: {self.current_successor_id}, Follower2: {self.current_follower_id}"
+            )
+
     def _start_maneuver_timer(self):
+        self.maneuver_count += 1
         self.maneuver_start_time = time.monotonic()
+        self.get_logger().info(f"현재 자동/수동 기동 회차: {self.maneuver_count}회")
+        self._publish_maneuver_metrics()
 
     def _publish_maneuver_metrics(self):
         elapsed = 0.0
@@ -211,6 +233,10 @@ class LaneFollowingNode(Node):
         duration_msg = Float32()
         duration_msg.data = float(self.last_maneuver_duration_sec)
         self.maneuver_last_duration_publisher.publish(duration_msg)
+
+        count_msg = Int32()
+        count_msg.data = int(self.maneuver_count)
+        self.maneuver_count_publisher.publish(count_msg)
 
     def _is_in_auto_trigger_zone(self, location) -> bool:
         return (
@@ -434,6 +460,26 @@ class LaneFollowingNode(Node):
         route = self.waypoint_routes.get(truck_id, [])
         return self._choose_route_target_from_route(route, transform, lookahead)
 
+    def _handoff_waypoint_route_to_target_lane(self, truck_id, direction):
+        current_wp = self.get_vehicle_waypoint(truck_id)
+        if current_wp is None:
+            return False
+
+        target_wp = self._find_adjacent_driving_lane(current_wp, direction)
+        if target_wp is None:
+            self.get_logger().warn(f"Truck {truck_id}: {direction} 방향 인접 차선 waypoint를 찾지 못했습니다")
+            return False
+
+        target_route = self._build_waypoint_route(truck_id, target_wp)
+        if not target_route:
+            self.get_logger().warn(f"Truck {truck_id}: {direction} 방향 목표 waypoint route 생성 실패")
+            return False
+
+        self.waypoint_routes[truck_id] = target_route
+        self.last_target_waypoint[truck_id] = target_route[0]
+        self.get_logger().info(f"Truck {truck_id}: {direction} 차선 waypoint route로 추종 경로 전환")
+        return True
+
 
     def _resolve_target_waypoint(self, truck_id):
         transform = self.get_vehicle_transform(truck_id)
@@ -609,6 +655,34 @@ class LaneFollowingNode(Node):
     def velocity_callback(self, msg, truck_id):
         self.current_velocities[truck_id] = msg.data
 
+    def _maybe_complete_camera_lane_change(self, truck_id, lane_positions, img_width, steering_angle):
+        target_lane = self.current_target_lane.get(truck_id, 'center')
+        if target_lane == 'center':
+            return False
+        if self.transition_factor.get(truck_id, 0.0) < 0.55:
+            return False
+        if not lane_positions:
+            return False
+
+        center_left = lane_positions.get('center_left')
+        center_right = lane_positions.get('center_right')
+        if center_left is None or center_right is None:
+            return False
+
+        lane_center = (center_left + center_right) / 2.0
+        img_center = img_width / 2.0
+        normalized_center_error = abs(lane_center - img_center) / max(1.0, img_center)
+        steering_abs = abs(float(steering_angle))
+
+        if normalized_center_error <= 0.06 and steering_abs <= 4.0:
+            self.get_logger().info(
+                f"Truck {truck_id}: 카메라 기준 차선 변경 조기 완료 \
+(center_error={normalized_center_error:.3f}, steer={steering_abs:.2f})"
+            )
+            self.reset_lane_state(truck_id)
+            return True
+        return False
+
     def camera_callback(self, msg, truck_id):
         frame = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         bev_image = apply_birds_eye_view(frame)
@@ -630,13 +704,14 @@ class LaneFollowingNode(Node):
         is_transitioning = is_changing and self.transition_factor[truck_id] < 1.0
         steering_angle = 0.0
         used_waypoint = False
-        target_waypoint = self._resolve_target_waypoint(truck_id)
-        waypoint_error = self._compute_waypoint_tracking_error(truck_id, target_waypoint)
 
-        if waypoint_error is not None:
-            pid_output = self.pid_controllers[truck_id].compute(waypoint_error)
-            steering_angle = float(np.clip(-pid_output * 80.0, -70.0, 70.0))
-            used_waypoint = True
+        if not is_changing:
+            target_waypoint = self._resolve_target_waypoint(truck_id)
+            waypoint_error = self._compute_waypoint_tracking_error(truck_id, target_waypoint)
+            if waypoint_error is not None:
+                pid_output = self.pid_controllers[truck_id].compute(waypoint_error)
+                steering_angle = float(np.clip(-pid_output * 80.0, -70.0, 70.0))
+                used_waypoint = True
 
         if not used_waypoint and not self.waypoint_tracking_only:
             steering_angle = calculate_steering(
@@ -647,6 +722,11 @@ class LaneFollowingNode(Node):
                 self.transition_factor[truck_id],
                 is_lane_changing=is_transitioning
             )
+
+        self._maybe_complete_camera_lane_change(
+            truck_id, lane_positions, frame.shape[1], steering_angle
+        )
+
         steer_msg = Float32(); steer_msg.data = steering_angle
         self.steer_publishers[truck_id].publish(steer_msg)
         self.last_steering[truck_id] = steering_angle
@@ -726,7 +806,12 @@ class LaneFollowingNode(Node):
         self.current_target_lane[truck_id] = direction
         self.pid_controllers[truck_id].reset()
         self.transition_factor[truck_id] = 0.0
-        
+        self._handoff_waypoint_route_to_target_lane(truck_id, direction)
+        transition_step = self.lc_step_left if direction == 'left' else self.lc_step_right
+        self.get_logger().info(
+            f"Truck {truck_id}: {direction} 차선 변경 전환 속도 step={transition_step:.3f}"
+        )
+
         def update_transition():
             if self.current_target_lane.get(truck_id) != direction:
                 if self.transition_timer.get(truck_id):
@@ -734,7 +819,7 @@ class LaneFollowingNode(Node):
                     self.transition_timer[truck_id] = None
                 return
 
-            self.transition_factor[truck_id] += self.lc_step
+            self.transition_factor[truck_id] += transition_step
             if self.transition_factor[truck_id] >= 1.0:
                 self.transition_factor[truck_id] = 1.0
                 self.get_logger().info(f"Truck {truck_id}: 차선 변경 애니메이션 완료")
@@ -757,6 +842,9 @@ class LaneFollowingNode(Node):
         self.pid_controllers[truck_id].reset()
         self.last_left_fit[truck_id] = None
         self.last_right_fit[truck_id] = None
+        self.last_target_waypoint[truck_id] = None
+        self.waypoint_routes[truck_id] = []
+        self.lane_change_waypoint_routes[truck_id] = {'left': [], 'right': []}
 
     def start_reorder_maneuver(self, direction):
         if self.maneuver_state != ManeuverState.IDLE:
@@ -959,6 +1047,7 @@ class LaneFollowingNode(Node):
             self.get_logger().info(f"= Promote 완료: 새로운 순서는 {self.truck_order} =")
 
         self._publish_truck_order()
+        self._refresh_idle_role_assignment()
 
         if self.maneuver_start_time is not None:
             self.last_maneuver_duration_sec = max(0.0, time.monotonic() - self.maneuver_start_time)
@@ -987,6 +1076,7 @@ class LaneFollowingNode(Node):
         self.promote_target_id = -1
         self.promote_original_leader_id = -1
         self.get_logger().info("===== 쿨다운 종료: IDLE 상태로 복귀 =====")
+        self._refresh_idle_role_assignment()
         self._publish_maneuver_metrics()
 
     def publish_commands_from_module(self):
@@ -1063,8 +1153,6 @@ class LaneFollowingNode(Node):
                 
                 slow_phases = (
                     ManeuverState.LEADER_CREATES_GAP,
-                    ManeuverState.SUCCESSOR_ENTERS_GAP,
-                    ManeuverState.FOLLOWER_ENTERS_GAP,
                 )
                 if truck_id == self.exiting_leader_id and self.maneuver_state in slow_phases:
                     gap_creation_speed = self.target_velocity * self.leader_slow_factor

@@ -24,10 +24,13 @@ class PlatooningManager:
         self.lidar_pitch = 0.0
 
         # PID 제어 파라미터
-        self.min_distance = 5.0      # 정지 시 최소 간격 (m)
-        self.time_gap = 0.8          # 시간 간격 (s)
+        self.min_distance = 4.0      # 정지 시 최소 간격 (m)
+        self.time_gap = 0.6          # 시간 간격 (s)
         self.target_distance = 3.0  # 동적 계산 전 기본값 (m)
         self.safe_distance = 2.5     # 최소 안전 간격 (m) 이하이면 저속 혹은 정지
+        self.catchup_distance_margin = 1.5  # 목표 거리보다 더 벌어졌을 때 가속 보너스 시작
+        self.catchup_speed_gain = 0.35      # 거리 초과분(m)당 추가 목표 속도(m/s)
+        self.catchup_speed_cap = 4.0        # 선행차 대비 추가 목표 속도 상한(m/s)
         self.kp = 0.3
         self.ki = 0.01
         self.kd = 1.8
@@ -84,14 +87,20 @@ class PlatooningManager:
                            0.01 * self.integral +
                            0.1 * derivative)
 
-        # 2. 최종 목표 속도 = 선행 차량 속도 + 거리 보정 속도
-        target_velocity = leader_velocity + dist_correction
+        catchup_boost = 0.0
+        if distance_error > self.catchup_distance_margin:
+            catchup_boost = min(
+                self.catchup_speed_cap,
+                (distance_error - self.catchup_distance_margin) * self.catchup_speed_gain,
+            )
+
+        # 2. 최종 목표 속도 = 선행 차량 속도 + 거리 보정 속도 + 추종 보너스
+        target_velocity = leader_velocity + dist_correction + catchup_boost
         
         # 3. 목표 속도 추종을 위한 스로틀 계산 (단순 P 제어)
         if ego_velocity is not None:
             vel_error = target_velocity - ego_velocity
-            # 속도 오차 1m/s당 0.2 스로틀 보정
-            speed_command = vel_error * 0.4
+            speed_command = vel_error * 0.5
         else:
             # ego_velocity 없을 경우 기존 방식 fallback (단, 베이스가 선행차 속도이므로 더 안정적)
             speed_command = dist_correction * 0.2

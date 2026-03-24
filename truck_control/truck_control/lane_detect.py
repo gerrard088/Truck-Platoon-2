@@ -179,6 +179,12 @@ def calculate_steering(pid_controller, lane_positions, img_width, target_lane='c
     pid_output = pid_controller.compute(error)
 
     if is_lane_changing:
-        return np.clip(-pid_output * 20.0, -15.0, 15.0)
+        if target_lane == 'right':
+            steer_gain = 13.0
+            steer_limit = 9.0
+        else:
+            steer_gain = 15.0
+            steer_limit = 11.0
+        return np.clip(-pid_output * steer_gain, -steer_limit, steer_limit)
     else:
         return np.clip(-pid_output * 35.0, -30.0, 30.0)

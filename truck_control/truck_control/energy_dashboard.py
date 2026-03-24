@@ -5,7 +5,7 @@ from typing import Dict
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float32
+from std_msgs.msg import Float32, Int32
 
 
 @dataclass
@@ -24,9 +24,11 @@ class EnergySubscriber(Node):
         self.states: Dict[int, TruckEnergyState] = {i: TruckEnergyState() for i in range(self.truck_count)}
         self.maneuver_elapsed_sec = 0.0
         self.last_maneuver_duration_sec = 0.0
+        self.maneuver_count = 0
 
         self.create_subscription(Float32, '/platoon_maneuver_elapsed_sec', self._maneuver_elapsed_cb, 10)
         self.create_subscription(Float32, '/platoon_maneuver_last_duration_sec', self._maneuver_last_duration_cb, 10)
+        self.create_subscription(Int32, '/platoon_maneuver_count', self._maneuver_count_cb, 10)
 
         for truck_id in range(self.truck_count):
             self.create_subscription(
@@ -62,8 +64,16 @@ class EnergySubscriber(Node):
     def _maneuver_last_duration_cb(self, msg: Float32) -> None:
         self.last_maneuver_duration_sec = float(msg.data)
 
+    def _maneuver_count_cb(self, msg: Int32) -> None:
+        self.maneuver_count = int(msg.data)
+
     def _update_ui(self) -> None:
-        self.dashboard.update(self.states, self.maneuver_elapsed_sec, self.last_maneuver_duration_sec)
+        self.dashboard.update(
+            self.states,
+            self.maneuver_elapsed_sec,
+            self.last_maneuver_duration_sec,
+            self.maneuver_count,
+        )
 
 
 class EnergyDashboardUI:
@@ -101,6 +111,24 @@ class EnergyDashboardUI:
             fg="#2B4A6F",
         )
         self.summary_label.pack(anchor="e")
+
+        self.fleet_soc_label = tk.Label(
+            summary_frame,
+            text="Fleet SOC Avg: 0.0 % | Sum: 0.0 %",
+            font=("Helvetica", 11, "bold"),
+            bg="#F3F6FA",
+            fg="#2B4A6F",
+        )
+        self.fleet_soc_label.pack(anchor="e", pady=(4, 0))
+
+        self.maneuver_count_label = tk.Label(
+            summary_frame,
+            text="Maneuver Count: 0",
+            font=("Helvetica", 11),
+            bg="#F3F6FA",
+            fg="#4A5568",
+        )
+        self.maneuver_count_label.pack(anchor="e", pady=(4, 0))
 
         self.maneuver_status_label = tk.Label(
             summary_frame,
@@ -165,13 +193,21 @@ class EnergyDashboardUI:
                 "power_canvas": power_canvas,
             }
 
-    def update(self, states: Dict[int, TruckEnergyState], maneuver_elapsed_sec: float, last_maneuver_duration_sec: float) -> None:
+    def update(
+        self,
+        states: Dict[int, TruckEnergyState],
+        maneuver_elapsed_sec: float,
+        last_maneuver_duration_sec: float,
+        maneuver_count: int,
+    ) -> None:
         total_whkm = 0.0
+        total_soc = 0.0
         for truck_id in range(self.truck_count):
             st = states[truck_id]
             speed_kmh = st.speed_ms * 3.6
             power_kw = st.power_w / 1000.0
             total_whkm += st.wh_per_km
+            total_soc += st.soc
 
             card = self.cards[truck_id]
             card["speed_label"].config(text=f"Speed: {speed_kmh:5.1f} km/h")
@@ -185,7 +221,10 @@ class EnergyDashboardUI:
             self._draw_bar(card["power_canvas"], power_ratio, power_color)
 
         avg = total_whkm / max(1, self.truck_count)
+        avg_soc = total_soc / max(1, self.truck_count)
         self.summary_label.config(text=f"Fleet Efficiency: {avg:.1f} Wh/km")
+        self.fleet_soc_label.config(text=f"Fleet SOC Avg: {avg_soc:.1f} % | Sum: {total_soc:.1f} %")
+        self.maneuver_count_label.config(text=f"Maneuver Count: {maneuver_count}")
 
         if maneuver_elapsed_sec > 0.0:
             self.maneuver_status_label.config(text=f"Maneuver Running: {maneuver_elapsed_sec:.1f} s")
