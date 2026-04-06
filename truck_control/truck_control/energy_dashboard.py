@@ -1,4 +1,5 @@
 import signal
+import time
 import tkinter as tk
 from dataclasses import dataclass
 from typing import Dict
@@ -26,6 +27,10 @@ class EnergySubscriber(Node):
         self.last_maneuver_duration_sec = 0.0
         self.maneuver_count = 0
         self.truck_roles: Dict[int, str] = {0: 'Leader', 1: 'Mid', 2: 'Tail'}
+        self.total_drive_time_sec = 0.0
+        self.total_drive_distance_m = 0.0
+        self.measurements_frozen = False
+        self._last_ui_update_monotonic = time.monotonic()
 
         self.create_subscription(Float32, '/platoon_maneuver_elapsed_sec', self._maneuver_elapsed_cb, 10)
         self.create_subscription(Float32, '/platoon_maneuver_last_duration_sec', self._maneuver_last_duration_cb, 10)
@@ -49,15 +54,28 @@ class EnergySubscriber(Node):
         self.create_timer(0.1, self._update_ui)
 
     def _speed_cb(self, msg: Float32, truck_id: int) -> None:
+        if self.measurements_frozen:
+            return
         self.states[truck_id].speed_ms = float(msg.data)
 
     def _soc_cb(self, msg: Float32, truck_id: int) -> None:
+        if self.measurements_frozen:
+            return
         self.states[truck_id].soc = float(msg.data)
+        if self.states[truck_id].soc <= 0.0:
+            self.measurements_frozen = True
+            self.get_logger().warn(
+                f"Truck {truck_id} SOC depleted. Dashboard measurements are now frozen."
+            )
 
     def _power_cb(self, msg: Float32, truck_id: int) -> None:
+        if self.measurements_frozen:
+            return
         self.states[truck_id].power_w = float(msg.data)
 
     def _whkm_cb(self, msg: Float32, truck_id: int) -> None:
+        if self.measurements_frozen:
+            return
         self.states[truck_id].wh_per_km = float(msg.data)
 
     def _maneuver_elapsed_cb(self, msg: Float32) -> None:
@@ -70,6 +88,8 @@ class EnergySubscriber(Node):
         self.maneuver_count = int(msg.data)
 
     def _platoon_order_cb(self, msg: Int32MultiArray) -> None:
+        if self.measurements_frozen:
+            return
         order = [int(truck_id) for truck_id in msg.data]
         if len(order) != self.truck_count:
             return
@@ -80,12 +100,22 @@ class EnergySubscriber(Node):
             self.truck_roles[truck_id] = label
 
     def _update_ui(self) -> None:
+        now = time.monotonic()
+        dt = max(0.0, now - self._last_ui_update_monotonic)
+        self._last_ui_update_monotonic = now
+        if (not self.measurements_frozen) and any(state.speed_ms > 0.1 for state in self.states.values()):
+            self.total_drive_time_sec += dt
+            self.total_drive_distance_m += sum(max(0.0, state.speed_ms) * dt for state in self.states.values())
+
         self.dashboard.update(
             self.states,
             self.truck_roles,
+            self.total_drive_time_sec,
+            self.total_drive_distance_m,
             self.maneuver_elapsed_sec,
             self.last_maneuver_duration_sec,
             self.maneuver_count,
+            self.measurements_frozen,
         )
 
 
@@ -161,6 +191,24 @@ class EnergyDashboardUI:
         )
         self.maneuver_duration_label.pack(anchor="e")
 
+        self.total_drive_time_label = tk.Label(
+            summary_frame,
+            text="Total Drive Time: 00:00:00",
+            font=("Helvetica", 11),
+            bg="#F3F6FA",
+            fg="#4A5568",
+        )
+        self.total_drive_time_label.pack(anchor="e", pady=(4, 0))
+
+        self.total_drive_distance_label = tk.Label(
+            summary_frame,
+            text="Total Drive Distance: 0.00 km",
+            font=("Helvetica", 11),
+            bg="#F3F6FA",
+            fg="#4A5568",
+        )
+        self.total_drive_distance_label.pack(anchor="e", pady=(4, 0))
+
         body = tk.Frame(self.root, bg="#F3F6FA")
         body.pack(fill=tk.BOTH, expand=True, padx=12, pady=6)
 
@@ -214,9 +262,12 @@ class EnergyDashboardUI:
         self,
         states: Dict[int, TruckEnergyState],
         truck_roles: Dict[int, str],
+        total_drive_time_sec: float,
+        total_drive_distance_m: float,
         maneuver_elapsed_sec: float,
         last_maneuver_duration_sec: float,
         maneuver_count: int,
+        measurements_frozen: bool,
     ) -> None:
         total_whkm = 0.0
         total_soc = 0.0
@@ -250,7 +301,22 @@ class EnergyDashboardUI:
         else:
             self.maneuver_status_label.config(text="Maneuver: Idle")
 
-        self.maneuver_duration_label.config(text=f"Last Maneuver: {last_maneuver_duration_sec:.1f} s")
+        status_suffix = ' [Frozen]' if measurements_frozen else ''
+        self.maneuver_duration_label.config(text=f"Last Maneuver: {last_maneuver_duration_sec:.1f} s{status_suffix}")
+        self.total_drive_time_label.config(
+            text=f"Total Drive Time: {self._format_hms(total_drive_time_sec)}{status_suffix}"
+        )
+        self.total_drive_distance_label.config(
+            text=f"Total Drive Distance: {total_drive_distance_m / 1000.0:.2f} km{status_suffix}"
+        )
+
+    @staticmethod
+    def _format_hms(total_seconds: float) -> str:
+        total_seconds = max(0, int(total_seconds))
+        hours = total_seconds // 3600
+        minutes = (total_seconds % 3600) // 60
+        seconds = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     @staticmethod
     def _draw_bar(canvas: tk.Canvas, ratio: float, color: str) -> None:

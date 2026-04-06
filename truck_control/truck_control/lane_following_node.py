@@ -14,7 +14,7 @@ import cv2
 import numpy as np
 import carla
 from .pid_controller import PIDController
-from .lane_detect import apply_birds_eye_view, detect_lane, calculate_steering
+from .lane_detect import apply_birds_eye_view, detect_lane, calculate_steering, reset_lane_tracking_state
 from .command_publisher import publish_commands
 from .distance_sensor import DistanceSensor
 from .platooning_manager import PlatooningManager
@@ -34,6 +34,12 @@ class ManeuverState:
     # --- 공통 완료/쿨다운 상태 ---
     REORDER_COMPLETE = 5
     COOLDOWN = 6
+
+
+class DriveMode:
+    HOLD_LANE = 1
+    AUTO_REORDER = 2
+    AUTO_PROMOTE_TAIL = 3
 
 class LaneFollowingNode(Node):
     def __init__(self):
@@ -55,6 +61,7 @@ class LaneFollowingNode(Node):
         self.current_leader_id = self.truck_order[0]
         self.current_successor_id = self.truck_order[1]
         self.current_follower_id = self.truck_order[2]
+        self.selected_drive_mode = None
         self.maneuver_start_time = None
         self.last_maneuver_duration_sec = 0.0
         self.maneuver_count = 0
@@ -65,6 +72,7 @@ class LaneFollowingNode(Node):
         self.steer_publishers = {i: self.create_publisher(Float32, f'/truck{i}/steer_control', 10) for i in range(3)}
         self.throttle_publishers = {i: self.create_publisher(Float32, f'/truck{i}/throttle_control', 10) for i in range(3)}
         self.order_publisher = self.create_publisher(Int32MultiArray, '/platoon_order', 10)
+        self.drive_mode_publisher = self.create_publisher(Int32, '/drive_mode', 10)
         self.maneuver_elapsed_publisher = self.create_publisher(Float32, '/platoon_maneuver_elapsed_sec', 10)
         self.maneuver_last_duration_publisher = self.create_publisher(Float32, '/platoon_maneuver_last_duration_sec', 10)
         self.maneuver_count_publisher = self.create_publisher(Int32, '/platoon_maneuver_count', 10)
@@ -127,12 +135,13 @@ class LaneFollowingNode(Node):
         
         # lane-change timing tunables
         self.lc_dt = 0.1
-        self.lc_step = 0.04
-        self.lc_step_left = 0.032
+        self.lc_step = 0.06
+        self.lc_step_left = 0.02
         self.lc_step_right = 0.02
         
         # maneuver timing/speeds
         self.leader_slow_factor = 0.65
+        self.promote_reentry_target_speed_factor = 1.0
         self.cooldown_sec = 1.0 # 기동 후 안정화를 위해 1초 쿨다운
         
         # LiDAR Guard parameters
@@ -150,6 +159,7 @@ class LaneFollowingNode(Node):
         # Rejoin check parameters
         self._rejoin_timer = None
         self.rejoin_check_period = 0.05
+        self.follower_force_change_started_at = None
 
         # CARLA 좌표 기반 기동 파라미터
         self.REORDER_SAFE_GAP_DISTANCE_M = 25.0 
@@ -160,11 +170,12 @@ class LaneFollowingNode(Node):
         # Auto scenario trigger on a designated straight segment.
         self.auto_scenario_enabled = True
         self.auto_trigger_center_x = -9.2
-        self.auto_trigger_center_y = -93.3
+        self.auto_trigger_center_y = -113.3
         self.auto_trigger_half_x_m = 3.0 + self.waypoint_lane_width_m
         self.auto_trigger_half_y_m = 12.0
+        self.auto_promote_trigger_forward_shift_m = 30.0
         self.auto_trigger_latched = False
-        self.auto_next_direction = 'left'
+        self.auto_next_direction = 'right'
         
         # CARLA Actor 정보 저장
         self.carla_actors = {}
@@ -238,29 +249,84 @@ class LaneFollowingNode(Node):
         count_msg.data = int(self.maneuver_count)
         self.maneuver_count_publisher.publish(count_msg)
 
-    def _is_in_auto_trigger_zone(self, location) -> bool:
+    def _trigger_zone_center(self, leader_tf=None):
+        center_x = self.auto_trigger_center_x
+        center_y = self.auto_trigger_center_y
+
+        if (
+            self.selected_drive_mode == DriveMode.AUTO_PROMOTE_TAIL
+            and leader_tf is not None
+            and self.auto_promote_trigger_forward_shift_m > 0.0
+        ):
+            forward = leader_tf.get_forward_vector()
+            center_x -= float(forward.x) * self.auto_promote_trigger_forward_shift_m
+            center_y -= float(forward.y) * self.auto_promote_trigger_forward_shift_m
+
+        return center_x, center_y
+
+    def _draw_auto_trigger_zone(self, leader_tf=None) -> None:
+        if self.world is None:
+            return
+
+        center_x, center_y = self._trigger_zone_center(leader_tf)
+        center = carla.Location(x=float(center_x), y=float(center_y), z=0.5)
+        extent = carla.Vector3D(
+            x=float(self.auto_trigger_half_x_m),
+            y=float(self.auto_trigger_half_y_m),
+            z=1.0,
+        )
+        box = carla.BoundingBox(center, extent)
+        rotation = leader_tf.rotation if leader_tf is not None else carla.Rotation()
+        color = carla.Color(255, 180, 0) if self.selected_drive_mode == DriveMode.AUTO_PROMOTE_TAIL else carla.Color(0, 200, 255)
+
+        try:
+            self.world.debug.draw_box(
+                box,
+                rotation,
+                thickness=0.12,
+                color=color,
+                life_time=0.25,
+            )
+            label = "Scenario 3 Trigger Zone" if self.selected_drive_mode == DriveMode.AUTO_PROMOTE_TAIL else "Auto Trigger Zone"
+            self.world.debug.draw_string(
+                center + carla.Location(z=1.5),
+                label,
+                draw_shadow=False,
+                color=color,
+                life_time=0.25,
+            )
+        except Exception:
+            pass
+
+    def _is_in_auto_trigger_zone(self, location, leader_tf=None) -> bool:
+        center_x, center_y = self._trigger_zone_center(leader_tf)
         return (
-            abs(float(location.x) - self.auto_trigger_center_x) <= self.auto_trigger_half_x_m
-            and abs(float(location.y) - self.auto_trigger_center_y) <= self.auto_trigger_half_y_m
+            abs(float(location.x) - center_x) <= self.auto_trigger_half_x_m
+            and abs(float(location.y) - center_y) <= self.auto_trigger_half_y_m
         )
 
-    def _maybe_trigger_auto_scenario(self):
-        leader_id = self.truck_order[0] if self.truck_order else None
-        leader_tf = self.get_vehicle_transform(leader_id) if leader_id is not None else None
-        if leader_tf is None:
+    def _drive_mode_label(self):
+        labels = {
+            DriveMode.HOLD_LANE: "1: Lane Keep",
+            DriveMode.AUTO_REORDER: "2: Auto Reorder",
+            DriveMode.AUTO_PROMOTE_TAIL: "3: Auto Promote Tail",
+        }
+        return labels.get(self.selected_drive_mode, "Not Selected")
+
+    def select_drive_mode(self, mode: int):
+        if mode not in (DriveMode.HOLD_LANE, DriveMode.AUTO_REORDER, DriveMode.AUTO_PROMOTE_TAIL):
+            self.get_logger().warn(f"지원하지 않는 주행 모드 선택: {mode}")
             return
 
-        in_zone = self._is_in_auto_trigger_zone(leader_tf.location)
-        if not in_zone:
-            self.auto_trigger_latched = False
-            return
+        self.selected_drive_mode = mode
+        self.auto_trigger_latched = False
+        self.auto_next_direction = 'right'
+        mode_msg = Int32()
+        mode_msg.data = int(mode)
+        self.drive_mode_publisher.publish(mode_msg)
+        self.get_logger().info(f"주행 모드 선택 완료 -> {self._drive_mode_label()}")
 
-        if self.auto_trigger_latched:
-            return
-
-        if not self.auto_scenario_enabled or self.maneuver_state != ManeuverState.IDLE:
-            return
-
+    def _trigger_auto_reorder_scenario(self, leader_tf) -> bool:
         direction = self.auto_next_direction
         if self.start_reorder_maneuver(direction):
             self.auto_trigger_latched = True
@@ -268,6 +334,51 @@ class LaneFollowingNode(Node):
             self.get_logger().info(
                 f"Auto scenario triggered at ({leader_tf.location.x:.1f}, {leader_tf.location.y:.1f}) -> {direction}"
             )
+            return True
+        return False
+
+    def _trigger_auto_promote_tail_scenario(self, leader_tf) -> bool:
+        if len(self.truck_order) < 3:
+            return False
+
+        target_id = self.truck_order[2]
+        if self.start_promote_maneuver(target_id, 'left'):
+            self.auto_trigger_latched = True
+            self.get_logger().info(
+                f"Auto scenario triggered at ({leader_tf.location.x:.1f}, {leader_tf.location.y:.1f}) -> promote tail truck {target_id} -> left"
+            )
+            return True
+        return False
+
+    def _maybe_trigger_auto_scenario(self):
+        if self.selected_drive_mode is None:
+            return
+
+        leader_id = self.truck_order[0] if self.truck_order else None
+        leader_tf = self.get_vehicle_transform(leader_id) if leader_id is not None else None
+        if leader_tf is None:
+            return
+
+        self._draw_auto_trigger_zone(leader_tf)
+        in_zone = self._is_in_auto_trigger_zone(leader_tf.location, leader_tf)
+        if not in_zone:
+            self.auto_trigger_latched = False
+            return
+
+        if self.auto_trigger_latched:
+            return
+
+        if (
+            not self.auto_scenario_enabled
+            or self.maneuver_state != ManeuverState.IDLE
+            or self.selected_drive_mode == DriveMode.HOLD_LANE
+        ):
+            return
+
+        if self.selected_drive_mode == DriveMode.AUTO_REORDER:
+            self._trigger_auto_reorder_scenario(leader_tf)
+        elif self.selected_drive_mode == DriveMode.AUTO_PROMOTE_TAIL:
+            self._trigger_auto_promote_tail_scenario(leader_tf)
 
     def get_vehicle_waypoint(self, truck_id):
         actor = self.carla_actors.get(truck_id)
@@ -569,6 +680,11 @@ class LaneFollowingNode(Node):
             except Exception: pass
         self._guard_pending[truck_id] = False
 
+    def _reset_follower_guard_state(self):
+        for truck_id in range(3):
+            self._cancel_guard(truck_id, "FOLLOWER")
+        self.follower_force_change_started_at = None
+
     def _guarded_lane_change(self, truck_id, direction, tag=''):
         if self._guard_pending.get(truck_id, False):
             self.get_logger().info(f"[{tag}] Truck {truck_id} 가드 이미 진행 중")
@@ -647,6 +763,33 @@ class LaneFollowingNode(Node):
         gap_distance = forward_distance - follower_extent - leader_extent
         return max(0.0, gap_distance)
 
+    def _complete_lane_change(self, truck_id, reason=''):
+        target_lane = self.current_target_lane.get(truck_id, 'center')
+        if target_lane not in ('left', 'right'):
+            return False
+
+        if self.transition_timer.get(truck_id):
+            self.transition_timer[truck_id].cancel()
+            self.transition_timer[truck_id] = None
+
+        target_route = list(self.waypoint_routes.get(truck_id, []))
+        if target_route:
+            self.last_target_waypoint[truck_id] = target_route[0]
+
+        self.current_target_lane[truck_id] = 'center'
+        self.transition_factor[truck_id] = 1.0
+        self.pid_controllers[truck_id].reset()
+        self.last_left_fit[truck_id] = None
+        self.last_right_fit[truck_id] = None
+        self.lane_change_waypoint_routes[truck_id] = {'left': [], 'right': []}
+        reset_lane_tracking_state(truck_id)
+
+        if reason:
+            self.get_logger().info(f"Truck {truck_id}: 차선 변경 완료 ({reason})")
+        else:
+            self.get_logger().info(f"Truck {truck_id}: 차선 변경 완료")
+        return True
+
     def ss_callback(self, msg: Image, truck_id: int):
         try:
             ss_img = self.bridge.imgmsg_to_cv2(msg, 'mono8')
@@ -686,8 +829,7 @@ class LaneFollowingNode(Node):
                 f"Truck {truck_id}: 카메라 기준 차선 변경 조기 완료 \
 (center_error={normalized_center_error:.3f}, steer={steering_abs:.2f})"
             )
-            self.reset_lane_state(truck_id)
-            return True
+            return self._complete_lane_change(truck_id, reason="camera alignment")
         return False
 
     def camera_callback(self, msg, truck_id):
@@ -708,31 +850,34 @@ class LaneFollowingNode(Node):
         self.last_left_slope[truck_id] = lslope
         self.last_right_slope[truck_id] = rslope
         is_changing = self.current_target_lane[truck_id] != 'center'
-        is_transitioning = is_changing and self.transition_factor[truck_id] < 1.0
-        steering_angle = 0.0
-        used_waypoint = False
+        use_camera_guidance = (self.current_target_lane[truck_id] != 'center') or (
+            self.maneuver_state not in (ManeuverState.IDLE, ManeuverState.COOLDOWN)
+        )
 
-        if not is_changing:
-            target_waypoint = self._resolve_target_waypoint(truck_id)
-            waypoint_error = self._compute_waypoint_tracking_error(truck_id, target_waypoint)
-            if waypoint_error is not None:
-                pid_output = self.pid_controllers[truck_id].compute(waypoint_error)
-                steering_angle = float(np.clip(-pid_output * 80.0, -70.0, 70.0))
-                used_waypoint = True
-
-        if not used_waypoint and not self.waypoint_tracking_only:
+        if use_camera_guidance:
             steering_angle = calculate_steering(
                 self.pid_controllers[truck_id],
                 lane_positions,
                 frame.shape[1],
                 self.current_target_lane[truck_id],
                 self.transition_factor[truck_id],
-                is_lane_changing=is_transitioning
+                is_lane_changing=is_changing
             )
-
-        self._maybe_complete_camera_lane_change(
-            truck_id, lane_positions, frame.shape[1], steering_angle
-        )
+        else:
+            target_waypoint = self._resolve_target_waypoint(truck_id)
+            waypoint_error = self._compute_waypoint_tracking_error(truck_id, target_waypoint)
+            if waypoint_error is not None:
+                pid_output = self.pid_controllers[truck_id].compute(waypoint_error)
+                steering_angle = float(np.clip(-pid_output * 80.0, -70.0, 70.0))
+            else:
+                steering_angle = calculate_steering(
+                    self.pid_controllers[truck_id],
+                    lane_positions,
+                    frame.shape[1],
+                    self.current_target_lane[truck_id],
+                    self.transition_factor[truck_id],
+                    is_lane_changing=is_changing
+                )
 
         steer_msg = Float32(); steer_msg.data = steering_angle
         self.steer_publishers[truck_id].publish(steer_msg)
@@ -813,11 +958,6 @@ class LaneFollowingNode(Node):
         self.current_target_lane[truck_id] = direction
         self.pid_controllers[truck_id].reset()
         self.transition_factor[truck_id] = 0.0
-        self._handoff_waypoint_route_to_target_lane(truck_id, direction)
-        transition_step = self.lc_step_left if direction == 'left' else self.lc_step_right
-        self.get_logger().info(
-            f"Truck {truck_id}: {direction} 차선 변경 전환 속도 step={transition_step:.3f}"
-        )
 
         def update_transition():
             if self.current_target_lane.get(truck_id) != direction:
@@ -826,7 +966,7 @@ class LaneFollowingNode(Node):
                     self.transition_timer[truck_id] = None
                 return
 
-            self.transition_factor[truck_id] += transition_step
+            self.transition_factor[truck_id] += self.lc_step
             if self.transition_factor[truck_id] >= 1.0:
                 self.transition_factor[truck_id] = 1.0
                 self.get_logger().info(f"Truck {truck_id}: 차선 변경 애니메이션 완료")
@@ -852,11 +992,14 @@ class LaneFollowingNode(Node):
         self.last_target_waypoint[truck_id] = None
         self.waypoint_routes[truck_id] = []
         self.lane_change_waypoint_routes[truck_id] = {'left': [], 'right': []}
+        if truck_id == self.truck_order[0]:
+            self.shared_waypoint_route = []
 
     def start_reorder_maneuver(self, direction):
         if self.maneuver_state != ManeuverState.IDLE:
             self.get_logger().warn("이미 재배치 진행 중")
             return False
+        self._reset_follower_guard_state()
         self.reorder_direction = direction
         self.exiting_leader_id = self.truck_order[0]
         self.successor_id = self.truck_order[1]
@@ -934,15 +1077,28 @@ class LaneFollowingNode(Node):
             if is_lane_change_complete(self.successor_id):
                 self.reset_lane_state(self.successor_id)
                 self.maneuver_state = ManeuverState.FOLLOWER_ENTERS_GAP
+                self.follower_force_change_started_at = time.monotonic()
                 self.get_logger().info("후속 차량(2번) 차선 변경 시도(라이다 가드)")
                 self._guarded_lane_change(self.follower_id, self.reorder_direction, tag="FOLLOWER")
 
         elif self.maneuver_state == ManeuverState.FOLLOWER_ENTERS_GAP:
             if is_lane_change_complete(self.follower_id):
+                self.follower_force_change_started_at = None
                 self.reset_lane_state(self.follower_id)
                 self.maneuver_state = ManeuverState.LEADER_REENTERS_LANE
                 self.get_logger().info("리더 재합류 대기 시작")
                 self._leader_reenter()
+            elif (
+                self.current_target_lane.get(self.follower_id, 'center') == 'center'
+                and self.follower_force_change_started_at is not None
+                and (time.monotonic() - self.follower_force_change_started_at) > self.change_timeout_sec
+            ):
+                self.get_logger().warn(
+                    f"Follower Truck {self.follower_id}가 제한 시간 내 차선변경을 시작하지 못해 직접 시작합니다."
+                )
+                self._cancel_guard(self.follower_id, "FOLLOWER")
+                self.change_lane(self.follower_id, self.reorder_direction)
+                self.follower_force_change_started_at = None
 
         elif self.maneuver_state == ManeuverState.LEADER_REENTERS_LANE:
             if is_lane_change_complete(self.exiting_leader_id):
@@ -1038,6 +1194,7 @@ class LaneFollowingNode(Node):
             self._cancel_guard(i, "FOLLOWER")
             self._cancel_guard(i, "PROMOTE_TARGET")
             self._cancel_guard(i, "REJOIN")
+        self._reset_follower_guard_state()
 
         if self._rejoin_timer:
             try: self._rejoin_timer.cancel()
@@ -1082,12 +1239,21 @@ class LaneFollowingNode(Node):
         self.follower_id = -1
         self.promote_target_id = -1
         self.promote_original_leader_id = -1
+        self._reset_follower_guard_state()
         self.get_logger().info("===== 쿨다운 종료: IDLE 상태로 복귀 =====")
         self._refresh_idle_role_assignment()
         self._publish_maneuver_metrics()
 
     def publish_commands_from_module(self):
         if not self.truck_order: return
+
+        if self.selected_drive_mode is None:
+            for truck_id in self.truck_order:
+                throttle_msg = Float32()
+                throttle_msg.data = -1.0
+                self.throttle_publishers[truck_id].publish(throttle_msg)
+            return
+
         current_leader_id = self.truck_order[0]
         
         is_promoting = self.maneuver_state in (
@@ -1098,7 +1264,7 @@ class LaneFollowingNode(Node):
         
         leader_front_distance = self.distance_sensor[current_leader_id].get_distance()
         self.emergency_stop = False
-        if leader_front_distance is not None and leader_front_distance < 3.0:
+        if leader_front_distance is not None and leader_front_distance < 0.0:
             self.emergency_stop = True
             self.get_logger().warn(f"[리더 Truck {current_leader_id}] 비상 정지! 전방 장애물 거리: {leader_front_distance:.2f} m")
 
@@ -1110,17 +1276,20 @@ class LaneFollowingNode(Node):
 
             if is_promoting:
                 if truck_id == self.promote_target_id:
-                    try:
-                        rank = self.truck_order.index(self.promote_target_id)
-                    except ValueError:
-                        rank = -1
-
-                    if rank == 1:
-                        promote_speed = self.target_velocity * 1.2
-                    elif rank == 2:
-                        promote_speed = self.target_velocity * 1.1
+                    if self.maneuver_state == ManeuverState.PROMOTE_TARGET_REENTERS:
+                        promote_speed = self.target_velocity * self.promote_reentry_target_speed_factor
                     else:
-                        promote_speed = self.target_velocity * 1.2
+                        try:
+                            rank = self.truck_order.index(self.promote_target_id)
+                        except ValueError:
+                            rank = -1
+
+                        if rank == 1:
+                            promote_speed = self.target_velocity * 1.2
+                        elif rank == 2:
+                            promote_speed = self.target_velocity * 1.1
+                        else:
+                            promote_speed = self.target_velocity * 1.2
 
                     publish_commands(
                         [self.throttle_publishers[truck_id]],
@@ -1130,6 +1299,17 @@ class LaneFollowingNode(Node):
                     )
                     continue
                 else:
+                    if (
+                        self.maneuver_state == ManeuverState.PROMOTE_TARGET_REENTERS
+                        and truck_id == self.promote_original_leader_id
+                    ):
+                        publish_commands(
+                            [self.throttle_publishers[truck_id]],
+                            [self.current_velocities.get(truck_id, 0.0)],
+                            self.target_velocity,
+                            [self.last_steering.get(truck_id, 0.0)]
+                        )
+                        continue
                     if (self.promote_target_id == self.truck_order[1]) and (truck_id == self.truck_order[2]):
                         publish_commands(
                             [self.throttle_publishers[truck_id]],
@@ -1139,8 +1319,7 @@ class LaneFollowingNode(Node):
                         )
                         continue
 
-                if self.maneuver_state in (ManeuverState.PROMOTE_PLATOON_CREATES_GAP,
-                                           ManeuverState.PROMOTE_TARGET_REENTERS):
+                if self.maneuver_state == ManeuverState.PROMOTE_PLATOON_CREATES_GAP:
                     gap_creation_speed = self.target_velocity * 0.8
                     publish_commands(
                         [self.throttle_publishers[truck_id]],
@@ -1184,12 +1363,14 @@ class LaneFollowingNode(Node):
                 else:
                     leader_id = self.truck_order[i - 1]
                     leader_vel = self.current_velocities.get(leader_id, self.target_velocity)
+                    platoon_leader_vel = self.current_velocities.get(self.truck_order[0], self.target_velocity)
                     ego_vel = self.current_velocities.get(truck_id, 0.0)
                     self.platooning_manager[truck_id].update_distance(
                         lidar_distance,
                         leader_vel,
                         emergency_stop=self.emergency_stop,
                         ego_velocity=ego_vel,
+                        platoon_leader_velocity=platoon_leader_vel if i >= 2 else None,
                     )
 
 def opencv_loop(node: LaneFollowingNode):
@@ -1197,14 +1378,21 @@ def opencv_loop(node: LaneFollowingNode):
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     while rclpy.ok():
         views = [node.truck_views.get(i) if node.truck_views.get(i) is not None else np.zeros((480, 640, 3), dtype=np.uint8) for i in node.truck_order]
-        if len(views) == 3: cv2.imshow(window_name, cv2.hconcat(views))
+        if len(views) == 3:
+            combined = cv2.hconcat(views)
+            mode_text = f"Drive Mode: {node._drive_mode_label()}"
+            cv2.putText(combined, mode_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 255), 2, cv2.LINE_AA)
+            if node.selected_drive_mode is None:
+                cv2.putText(combined, "Press 1: Lane Keep  2: Auto Reorder  3: Auto Promote Tail", (20, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+                cv2.putText(combined, "Driving is held until a mode is selected", (20, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+            cv2.imshow(window_name, combined)
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('t'): node.change_queue.put(('reorder', 'left'))
-        elif key == ord('y'): node.change_queue.put(('reorder', 'right'))
-        elif key == ord('j'):
-            if len(node.truck_order) > 1: node.change_queue.put(('promote', node.truck_order[1], 'left'))
-        elif key == ord('k'):
-            if len(node.truck_order) > 2: node.change_queue.put(('promote', node.truck_order[2], 'left'))
+        if key == ord('1'):
+            node.select_drive_mode(DriveMode.HOLD_LANE)
+        elif key == ord('2'):
+            node.select_drive_mode(DriveMode.AUTO_REORDER)
+        elif key == ord('3'):
+            node.select_drive_mode(DriveMode.AUTO_PROMOTE_TAIL)
         elif key == 27: break
     cv2.destroyAllWindows()
 

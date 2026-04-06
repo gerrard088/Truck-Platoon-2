@@ -1,4 +1,5 @@
 import csv
+import fcntl
 import math
 import os
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from std_msgs.msg import Float32, Float32MultiArray, Int32MultiArray
+from std_msgs.msg import Int32
 
 try:
     import matlab.engine  # type: ignore
@@ -33,6 +35,7 @@ class TruckState:
     distance_m: float = 0.0
     wh_per_km: float = 0.0
     battery_power_w: float = 0.0
+    throttle: float = float("nan")
 
 
 class EnergySocBridgeNode(Node):
@@ -54,6 +57,7 @@ class EnergySocBridgeNode(Node):
         self.declare_parameter("battery_capacity_kwh", 450.0)
         self.declare_parameter("initial_soc", 100.0)
         self.declare_parameter("platoon_order_topic", "/platoon_order")
+        self.declare_parameter("drive_mode_topic", "/drive_mode")
         self.declare_parameter("aero_drag_multipliers", [1.0, 0.75, 0.85])
         self.declare_parameter("use_pose_grade", True)
         self.declare_parameter("grade_smoothing_alpha", 0.25)
@@ -77,6 +81,7 @@ class EnergySocBridgeNode(Node):
         self.battery_capacity_kwh = float(self.get_parameter("battery_capacity_kwh").value)
         initial_soc = float(self.get_parameter("initial_soc").value)
         self.platoon_order_topic = str(self.get_parameter("platoon_order_topic").value)
+        self.drive_mode_topic = str(self.get_parameter("drive_mode_topic").value)
         raw_drag_multipliers = self.get_parameter("aero_drag_multipliers").value
         self.use_pose_grade = bool(self.get_parameter("use_pose_grade").value)
         self.grade_smoothing_alpha = float(self.get_parameter("grade_smoothing_alpha").value)
@@ -90,6 +95,8 @@ class EnergySocBridgeNode(Node):
         self.truck_rank_by_id: Dict[int, int] = {i: i for i in range(self.truck_count)}
         self.aero_drag_multipliers = self._sanitize_drag_multipliers(raw_drag_multipliers)
         self.last_update_time = self.get_clock().now()
+        self.measurements_frozen = False
+        self.logging_enabled = False
 
         self.soc_publishers: Dict[int, Any] = {}
         self.power_publishers: Dict[int, Any] = {}
@@ -97,6 +104,7 @@ class EnergySocBridgeNode(Node):
 
         self._csv_files: Dict[int, Any] = {}
         self._csv_writers: Dict[int, csv.writer] = {}
+        self._log_lock_file = None
 
         self._matlab_engine = None
         self._matlab_available = False
@@ -158,16 +166,47 @@ class EnergySocBridgeNode(Node):
 
     def _configure_loggers(self) -> None:
         os.makedirs(self.log_dir, exist_ok=True)
+        self._acquire_log_lock()
         for truck_id in range(self.truck_count):
             path = os.path.join(self.log_dir, f"truck{truck_id}_energy.csv")
-            f = open(path, "w", newline="", encoding="utf-8")
+            f = open(path, "w", newline="", encoding="utf-8", buffering=1)
             w = csv.writer(f)
-            w.writerow(["time_sec", "velocity_ms", "accel_ms2", "pitch_deg", "model_accel_ms2", "model_grade_deg", "battery_power_w", "soc", "wh_per_km"])
+            w.writerow([
+                "time_sec",
+                "velocity_ms",
+                "accel_ms2",
+                "pitch_deg",
+                "model_accel_ms2",
+                "model_grade_deg",
+                "battery_power_w",
+                "soc",
+                "wh_per_km",
+                "throttle",
+            ])
+            f.flush()
             self._csv_files[truck_id] = f
             self._csv_writers[truck_id] = w
 
+    def _acquire_log_lock(self) -> None:
+        lock_path = os.path.join(self.log_dir, ".energy_soc_bridge.lock")
+        self._log_lock_file = open(lock_path, "w", encoding="utf-8")
+        try:
+            fcntl.flock(self._log_lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            self._log_lock_file.close()
+            self._log_lock_file = None
+            raise RuntimeError(
+                f"log_dir is already locked by another energy_soc_bridge process: {self.log_dir}"
+            ) from exc
+
+        self._log_lock_file.seek(0)
+        self._log_lock_file.truncate()
+        self._log_lock_file.write(f"{os.getpid()}\n")
+        self._log_lock_file.flush()
+
     def _configure_io(self) -> None:
         self.create_subscription(Int32MultiArray, self.platoon_order_topic, self._order_cb, 10)
+        self.create_subscription(Int32, self.drive_mode_topic, self._drive_mode_cb, 10)
         for truck_id in range(self.truck_count):
             self.create_subscription(
                 Float32, f"/truck{truck_id}/velocity", lambda msg, i=truck_id: self._velocity_cb(msg, i), 10
@@ -180,6 +219,9 @@ class EnergySocBridgeNode(Node):
             )
             self.create_subscription(
                 PoseStamped, f"/truck{truck_id}/pose3d", lambda msg, i=truck_id: self._pose_cb(msg, i), 10
+            )
+            self.create_subscription(
+                Float32, f"/truck{truck_id}/throttle_control", lambda msg, i=truck_id: self._throttle_cb(msg, i), 10
             )
 
             self.soc_publishers[truck_id] = self.create_publisher(Float32, f"/truck{truck_id}/battery_soc", 10)
@@ -195,6 +237,9 @@ class EnergySocBridgeNode(Node):
 
     def _pitch_cb(self, msg: Float32, truck_id: int) -> None:
         self.states[truck_id].pitch_deg = float(msg.data)
+
+    def _throttle_cb(self, msg: Float32, truck_id: int) -> None:
+        self.states[truck_id].throttle = float(msg.data)
 
     def _pose_cb(self, msg: PoseStamped, truck_id: int) -> None:
         st = self.states[truck_id]
@@ -236,7 +281,18 @@ class EnergySocBridgeNode(Node):
         self.truck_rank_by_id = rank_by_id
         self.get_logger().info(f"Updated platoon order for energy model: {order}")
 
+    def _drive_mode_cb(self, msg: Int32) -> None:
+        mode = int(msg.data)
+        was_enabled = self.logging_enabled
+        self.logging_enabled = mode > 0
+        if self.logging_enabled and not was_enabled:
+            self.last_update_time = self.get_clock().now()
+            self.get_logger().info(f"Drive mode selected ({mode}). Energy logging enabled.")
+
     def _on_timer(self) -> None:
+        if self.measurements_frozen or not self.logging_enabled:
+            return
+
         now = self.get_clock().now()
         dt = (now - self.last_update_time).nanoseconds / 1e9
         if dt <= 0.0:
@@ -244,6 +300,7 @@ class EnergySocBridgeNode(Node):
         self.last_update_time = now
 
         stamp_sec = now.nanoseconds / 1e9
+        depleted_ids = []
         for truck_id in range(self.truck_count):
             st = self.states[truck_id]
             model_accel_ms2 = self._effective_accel_ms2(st, dt)
@@ -258,6 +315,8 @@ class EnergySocBridgeNode(Node):
             if self.battery_capacity_kwh > 0.0:
                 delta_soc = (delta_wh / 1000.0) / self.battery_capacity_kwh * 100.0
                 st.soc = max(0.0, min(100.0, st.soc - delta_soc))
+                if st.soc <= 0.0:
+                    depleted_ids.append(truck_id)
 
             if st.distance_m > 1.0:
                 st.wh_per_km = st.energy_wh / (st.distance_m / 1000.0)
@@ -268,7 +327,14 @@ class EnergySocBridgeNode(Node):
             self._csv_writers[truck_id].writerow(
                 [f"{stamp_sec:.3f}", f"{st.velocity_ms:.4f}", f"{st.accel_ms2:.4f}", f"{st.pitch_deg:.4f}",
                  f"{st.model_accel_ms2:.4f}", f"{model_grade_deg:.4f}", f"{st.battery_power_w:.2f}",
-                 f"{st.soc:.4f}", f"{st.wh_per_km:.4f}"]
+                 f"{st.soc:.4f}", f"{st.wh_per_km:.4f}", f"{st.throttle:.4f}"]
+            )
+            self._csv_files[truck_id].flush()
+
+        if depleted_ids:
+            self.measurements_frozen = True
+            self.get_logger().warn(
+                f"SOC depleted for truck(s) {depleted_ids}. Freezing all energy measurements."
             )
 
     def _effective_accel_ms2(self, st: TruckState, dt: float) -> float:
@@ -363,6 +429,16 @@ class EnergySocBridgeNode(Node):
                 f.close()
             except Exception:
                 pass
+        if self._log_lock_file is not None:
+            try:
+                fcntl.flock(self._log_lock_file.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            try:
+                self._log_lock_file.close()
+            except Exception:
+                pass
+            self._log_lock_file = None
         if self._matlab_engine is not None:
             try:
                 self._matlab_engine.quit()

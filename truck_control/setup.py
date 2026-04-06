@@ -39,6 +39,7 @@ setup(
             'energy_soc_bridge = truck_control.energy_soc_bridge:main',
             'energy_monitor = truck_control.energy_monitor:main',
             'energy_dashboard = truck_control.energy_dashboard:main',
+            'soc_cycle_dashboard = truck_control.soc_cycle_dashboard:main',
             'set_location = truck_control.set_location:main',
         ],
     },

@@ -24,18 +24,33 @@ class PlatooningManager:
         self.lidar_pitch = 0.0
 
         # PID 제어 파라미터
-        self.min_distance = 4.0      # 정지 시 최소 간격 (m)
+        self.min_distance = 2.0      # 정지 시 최소 간격 (m)
         self.time_gap = 0.6          # 시간 간격 (s)
-        self.target_distance = 3.0  # 동적 계산 전 기본값 (m)
+        self.target_distance = 8.0  # 목표 차량 간 거리 (m)
         self.safe_distance = 2.5     # 최소 안전 간격 (m) 이하이면 저속 혹은 정지
         self.catchup_distance_margin = 1.5  # 목표 거리보다 더 벌어졌을 때 가속 보너스 시작
-        self.catchup_speed_gain = 0.35      # 거리 초과분(m)당 추가 목표 속도(m/s)
-        self.catchup_speed_cap = 4.0        # 선행차 대비 추가 목표 속도 상한(m/s)
+        self.catchup_speed_gain = 0.2       # 거리 초과분(m)당 추가 목표 속도(m/s)
+        self.catchup_speed_cap = 2.0        # 선행차 대비 추가 목표 속도 상한(m/s)
+        self.predecessor_speed_weight = 0.65
+        self.platoon_leader_speed_weight = 0.35
+        self.sensor_loss_speed_gain = 0.25
+        self.sensor_loss_command_limit = 0.25
+        self.command_alpha = 1.0
+        self.last_speed_command = 0.0
         self.kp = 0.3
         self.ki = 0.01
         self.kd = 1.8
         self.integral = 0.0
         self.prev_error = 0.0
+
+        if namespace.endswith('truck2'):
+            self.catchup_speed_gain = 0.12
+            self.catchup_speed_cap = 1.2
+            self.predecessor_speed_weight = 0.4
+            self.platoon_leader_speed_weight = 0.6
+            self.sensor_loss_speed_gain = 0.18
+            self.sensor_loss_command_limit = 0.18
+            self.command_alpha = 0.35
 
         # dt 계산을 위한 이전 시간 초기화
         self.prev_time = time.time()
@@ -51,17 +66,19 @@ class PlatooningManager:
         self.lidar_pitch = lidar_msg.pitch
         self.control_speed()
 
-    def update_distance(self, lidar_distance, leader_velocity, emergency_stop=False, ego_velocity=None):
+    def update_distance(self, lidar_distance, leader_velocity, emergency_stop=False, ego_velocity=None, platoon_leader_velocity=None):
         self.lidar_distance = lidar_distance
-        # 목표 거리 설정 (고정 12m 또는 동적 거리)
-        if ego_velocity is not None:
-            self.target_distance = max(self.min_distance, self.min_distance + self.time_gap * float(ego_velocity))
-        else:
-            self.target_distance = 12.0  # 기본 목표 거리 12m로 설정
+        # 목표 거리 설정 (항상 8m 유지)
+        self.target_distance = 8.0
 
-        self.control_speed(leader_velocity, emergency_stop=emergency_stop, ego_velocity=ego_velocity)
+        self.control_speed(
+            leader_velocity,
+            emergency_stop=emergency_stop,
+            ego_velocity=ego_velocity,
+            platoon_leader_velocity=platoon_leader_velocity,
+        )
 
-    def control_speed(self, leader_velocity, emergency_stop=False, ego_velocity=None):
+    def control_speed(self, leader_velocity, emergency_stop=False, ego_velocity=None, platoon_leader_velocity=None):
         if emergency_stop:
             self.node.get_logger().info(f"[{self.namespace}] 비상 정지")
             throttle_msg = Float32()
@@ -69,7 +86,29 @@ class PlatooningManager:
             self.throttle_pub.publish(throttle_msg)
             return
 
+        speed_reference = float(leader_velocity)
+        if platoon_leader_velocity is not None:
+            speed_reference = (
+                self.predecessor_speed_weight * float(leader_velocity)
+                + self.platoon_leader_speed_weight * float(platoon_leader_velocity)
+            )
+
         if self.lidar_distance is None:
+            if ego_velocity is None:
+                return
+            vel_error = speed_reference - ego_velocity
+            raw_speed_command = max(
+                -self.sensor_loss_command_limit,
+                min(self.sensor_loss_command_limit, vel_error * self.sensor_loss_speed_gain)
+            )
+            speed_command = (
+                self.command_alpha * raw_speed_command
+                + (1.0 - self.command_alpha) * self.last_speed_command
+            )
+            throttle_msg = Float32()
+            throttle_msg.data = float(speed_command)
+            self.throttle_pub.publish(throttle_msg)
+            self.last_speed_command = float(speed_command)
             return
 
         current_time = time.time()
@@ -95,25 +134,30 @@ class PlatooningManager:
             )
 
         # 2. 최종 목표 속도 = 선행 차량 속도 + 거리 보정 속도 + 추종 보너스
-        target_velocity = leader_velocity + dist_correction + catchup_boost
+        target_velocity = speed_reference + dist_correction + catchup_boost
         
         # 3. 목표 속도 추종을 위한 스로틀 계산 (단순 P 제어)
         if ego_velocity is not None:
             vel_error = target_velocity - ego_velocity
-            speed_command = vel_error * 0.5
+            raw_speed_command = vel_error * 0.5
         else:
             # ego_velocity 없을 경우 기존 방식 fallback (단, 베이스가 선행차 속도이므로 더 안정적)
-            speed_command = dist_correction * 0.2
+            raw_speed_command = dist_correction * 0.2
 
         # 안전 거리 미만 시 강제 제동
         if self.lidar_distance < self.safe_distance:
-            speed_command = -1.0
-            
-        speed_command = max(-1.0, min(1.0, speed_command))
+            raw_speed_command = -1.0
+
+        raw_speed_command = max(-1.0, min(1.0, raw_speed_command))
+        speed_command = (
+            self.command_alpha * raw_speed_command
+            + (1.0 - self.command_alpha) * self.last_speed_command
+        )
 
         throttle_msg = Float32()
         throttle_msg.data = float(speed_command)
         self.throttle_pub.publish(throttle_msg)
 
+        self.last_speed_command = float(speed_command)
         self.prev_error = distance_error
         self.prev_time = current_time

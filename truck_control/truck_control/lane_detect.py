@@ -3,6 +3,17 @@ import numpy as np
 from scipy.signal import find_peaks
 
 _LAST_KNOWN_POSITIONS = {}
+_FILTERED_TARGET_CENTERS = {}
+
+
+def reset_lane_tracking_state(truck_id=None):
+    if truck_id is None:
+        _LAST_KNOWN_POSITIONS.clear()
+        _FILTERED_TARGET_CENTERS.clear()
+        return
+
+    _LAST_KNOWN_POSITIONS.pop(truck_id, None)
+    _FILTERED_TARGET_CENTERS.pop(truck_id, None)
 
 def apply_birds_eye_view(image):
     height, width = image.shape[:2]
@@ -28,7 +39,7 @@ def select_strategic_lanes(all_lane_centers, img_width):
     adj_right = right_lanes[1] if len(right_lanes) > 1 else None
     return center_left, center_right, adj_left, adj_right, sorted(left_lanes + right_lanes)
 
-def _get_fallback_seeds(edges, prefer_right_bias=0.1):
+def _get_fallback_seeds(edges, prefer_right_bias=0.0):
     h, w = edges.shape[:2]
     roi = edges[int(h * 0.6):, :]
     hist = np.sum(roi, axis=0)
@@ -75,7 +86,7 @@ def detect_lane(image, truck_id, last_left_fit, last_right_fit, last_left_slope,
     arx = arx or last_pos.get('adj_right')
 
     if clx is None or crx is None:
-        fallback_l, fallback_r = _get_fallback_seeds(edges, prefer_right_bias=0.1)
+        fallback_l, fallback_r = _get_fallback_seeds(edges, prefer_right_bias=0.0)
         clx = clx or fallback_l
         crx = crx or fallback_r
     if clx is None: clx = int(width * 0.25)
@@ -154,7 +165,7 @@ def detect_lane(image, truck_id, last_left_fit, last_right_fit, last_left_slope,
     return lane_overlay, lane_positions, extra
 
 def calculate_steering(pid_controller, lane_positions, img_width, target_lane='center',
-                       transition_factor=0.0, is_lane_changing=False):
+                       transition_factor=0.0, is_lane_changing=False, truck_id=None):
     if not lane_positions or lane_positions.get('center_left') is None or lane_positions.get('center_right') is None:
         return 0.0
 
@@ -173,15 +184,26 @@ def calculate_steering(pid_controller, lane_positions, img_width, target_lane='c
 
     blended_left  = current_left  + (target_left  - current_left)  * transition_factor
     blended_right = current_right + (target_right - current_right) * transition_factor
-    lane_center = (blended_left + blended_right) / 2
+    raw_lane_center = (blended_left + blended_right) / 2
+    lane_center = raw_lane_center
+
+    if truck_id is not None:
+        previous_lane_center = _FILTERED_TARGET_CENTERS.get(truck_id)
+        alpha = 0.18 if is_lane_changing else 0.35
+        if previous_lane_center is None or target_lane == 'center':
+            lane_center = raw_lane_center
+        else:
+            lane_center = ((1.0 - alpha) * previous_lane_center) + (alpha * raw_lane_center)
+        _FILTERED_TARGET_CENTERS[truck_id] = lane_center
+
     error = (lane_center - img_center) / img_center
 
     pid_output = pid_controller.compute(error)
 
     if is_lane_changing:
         if target_lane == 'right':
-            steer_gain = 13.0
-            steer_limit = 9.0
+            steer_gain = 15.0
+            steer_limit = 11.0
         else:
             steer_gain = 15.0
             steer_limit = 11.0
